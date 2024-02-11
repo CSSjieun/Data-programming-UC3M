@@ -37,7 +37,7 @@ The dataset to be used will be `student_ratio.csv`
 
 ```{r}
 library(readr)
-unesco_student <- read_csv(file = "~/Desktop/jieun/UC3M/data programming javier/data programming/student_ratio.csv")
+unesco_student <- read_csv(file = "./student_ratio.csv")
 unesco_student 
 ```
 
