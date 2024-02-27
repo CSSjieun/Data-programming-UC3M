@@ -1,0 +1,356 @@
+---
+title: "Task II revision"
+author: "Jieun Park"
+format:
+  html:
+    theme: [style.scss]
+    toc: true
+    toc-location: right
+    toc-title: Índice
+editor: visual
+---
+
+## Instructions (read before starting)
+
+-   Modify within the `.qmd` document your personal data (name and ID) located in the header of the file.
+
+-   Make sure, **BEFORE further editing the document**, that the `.qmd` file is rendered correctly and the corresponding `.html` is generated in your local folder on your computer.
+
+-   The chunks (code boxes) created are either empty or incomplete, hence most of them have the option `#| eval: false`. Once you edit what you consider, you must change each chunck to `#| eval: true` (or remove it directly) for them to be executed.
+
+-   Remember that you can execute chunk by chunk with the play button or execute all the chunks up to a given one (with the button to the left of the previous one).
+
+### Required packages
+
+We will need the following packages (play on the chunk to load them):
+
+```{r}
+
+rm(list = ls()) 
+library(glue)
+library(dplyr)
+library(tidyverse)
+```
+
+## Case study I: UNESCO data
+
+The dataset to be used will be `student_ratio.csv`
+
+```{r}
+library(readr)
+unesco_student <- read_csv(file = "./student_ratio.csv")
+unesco_student 
+```
+
+This dataset contains UNESCO educational data from different countries and years:
+
+-   `edulit_ind`: unique id.
+-   `indicator`: educational level
+-   `country_code`: country/territory code.
+-   `country`: country/territory name
+-   `year`: year
+-   `student_ratio`: pupil/teacher ratio
+
+### Exercise 1
+
+> Determine the percentage of records corresponding to each educational level.
+
+```{r}
+#Answer
+summary1 <- unesco_student |> 
+  summarise(count = n(), .by = indicator) |> 
+  mutate(percentage = (count/sum(count))*100)
+summary1
+```
+
+### Exercise 2
+
+> For each educational level, determine the territory with the highest ratio and the worst ratio. Repeat by educational level and year.
+
+```{r}
+#by eudcational level
+unesco_student |> filter(grepl("[A-Za-z]", country_code)) |> 
+  slice_max(student_ratio, with_ties = FALSE, by = indicator)
+  
+unesco_student |> filter(grepl("[A-Za-z]", country_code)) |> 
+  slice_min(student_ratio, with_ties = FALSE, by = indicator)
+
+unesco_student |> filter(grepl("[A-Za-z]", country_code)) |> 
+  slice_max(student_ratio, with_ties = FALSE, by = c(indicator, year))
+  
+unesco_student |> filter(grepl("[A-Za-z]", country_code)) |> 
+  slice_min(student_ratio, with_ties = FALSE, by = c(indicator, year))
+# 
+# 
+#   count(country_code) |>
+#   mutate(percentage = n/sum(n)*100) |> slice_max(percentage, n=1)
+# 
+# unesco_student |> filter(!grepl("[A-Za-z]", country_code)) |>
+#   group_by(indicator) |> count(country_code) |>
+#   mutate(percentage = n/sum(n)*100) |> slice_min(percentage, n=1)
+# 
+# # by educational level and year
+# unesco_student |> filter(!grepl("[A-Za-z]", country_code)) |>
+#   group_by(indicator, year) |> count(country_code) |>
+#   mutate(percentage = n/sum(n)*100) |> slice_max(percentage, n=1)
+# 
+# unesco_student |> filter(!grepl("[A-Za-z]", country_code)) |>
+#   group_by(indicator, year) |> count(country_code) |>
+#   mutate(percentage = n/sum(n)*100) |> slice_min(percentage, n=1)
+```
+
+### Exercise 3
+
+> Perform a stratified random sampling (by educational level) of 30% of the data. After doing so, perform the necessary checks to verify that the stratification has indeed been carried out properly.
+
+```{r}
+unesco_student_sample <-
+  unesco_student |>
+  slice_sample(prop = 0.3, by = indicator)
+unesco_student_sample
+  
+```
+
+```{r}
+unesco_student |>
+  count(indicator) |> 
+  mutate(prop = n/nrow(unesco_student)*100)
+
+unesco_student_sample |> 
+  group_by(indicator) |> 
+  summarise(freq = n()) |> 
+  mutate(prop = freq/nrow(unesco_student_sample)*100) |> 
+  ungroup()
+```
+
+### Exercise 4
+
+> Extracts (in a vector) the list of unique TERRITORIES from the table.
+
+```{r}
+unesco_student |>
+  filter(!grepl("[A-Za-z]", country_code)) |>
+  distinct(country) |>
+  pull(country)
+```
+
+### Exercise 5
+
+> Filter the table to keep only data corresponding to just countries (not territories/continents), counting only records from 2014 onwards.
+
+```{r}
+unesco_student_filter <-
+  unesco_student |> 
+  filter(grepl("[A-Za-z]", country_code) & year >= 2014)
+
+unesco_student_filter
+```
+
+### Exercise 6
+
+> Randomly sample 10% of the data, stratified by year, so that the probability of each country being chosen in the sample is proportional to its average ratio (among all educational levels, for each of those years).
+
+```{r}
+sample <-
+  unesco_student_filter |>
+  mutate(probabilities = mean(student_ratio, na.rm = TRUE), .by = year) |>
+  slice_sample(prop = 0.1, by = year, weight_by = probabilities)
+sample
+
+```
+
+### Exercise 8
+
+> Considering the dataset from the previous exercise, for each of the countries and educational level, keep only the last record (the most recent).
+
+```{r}
+sample |>
+  slice_max(year, by = c(country_code, indicator))
+```
+
+## Case study II: elections data
+
+As first exercise you must load the data `raw_election_data.csv` (electoral data by municipalities in Spain)
+
+```{r}
+raw_data <- read_csv(file ="./raw_election_data.csv")
+raw_data
+```
+
+Description of variables:
+
+-   `tipo_eleccion`: code for type of election (congress, senate, etc)
+
+-   `anno`, `mes`: year and month
+
+-   `vuelta`: turn
+
+-   `codigo_ccaa`, `codigo_provincia`, `codigo_municipio`, `codigo_distrito_electoral`: codes for region (ccaa), province, municipalities and districts.
+
+-   `numero_mesas`: number of poll stations.
+
+-   `censo`: census
+
+-   `participacion_1`, `participacion_2`: turnout at 14:00 and 18:00.
+
+-   `votos_blancos`, `votos_nulos`, `votos_candidaturas`: blank, invalid and candidacies ballots.
+
+The rest of the variables represent the number of ballots for different parties.
+
+### Exercise 1
+
+> Convert to tidy data properly. BE CAREFUL: maybe there are some variables that should be of one type but are imported in the wrong way. In case you find them, convert them to the type that they should be
+
+```{r}
+tidy_data <-
+  raw_data |> 
+  mutate(mes = as.numeric(mes)) |> 
+  pivot_longer("BERDEAK-LOS VERDES":"COALICIÓN POR MELILLA", names_to = "party", values_to = "votes", values_drop_na = TRUE)
+tidy_data
+```
+
+### Exercise 3
+
+> In statistics **information = variance**, so columns with constant values are not going to give us anything. Check which ones they are and eliminate them
+
+```{r}
+tidy_data |> 
+  distinct(tipo_eleccion) #constant
+
+tidy_data |> 
+  distinct(vuelta) #constant
+
+
+tidy_data <- 
+  tidy_data |> 
+  select(-tipo_eleccion, -vuelta, -codigo_distrito_electoral)
+```
+
+### Exercise 4
+
+> Assuming that each election was made on the 1st of each month, include a new column called `date` (as the first column) and delete month and year
+
+```{r}
+tidy_data2 <- 
+  tidy_data |> 
+  mutate(day = "01") |> 
+  unite(date, day, mes, anno, sep = "-") |> 
+  mutate(date = dmy(date))
+
+tidy_data2
+```
+
+### Exercise 5
+
+> For each election date, eliminate duplicates by municipality and party (if necessary, create the identifying columns - univocally - for municipalities using the variables in the database; be careful, municipality 001 always exists).
+
+```{r}
+tidy_data3 <- 
+  tidy_data2 |> 
+  mutate(id_mun = glue('{codigo_ccaa}-{codigo_provincia}-{codigo_municipio}'),
+        .after = date) |> 
+  group_by(date) |>
+  distinct(id_mun, party, .keep_all = TRUE) |>
+  ungroup()
+tidy_data3
+```
+
+### Exercise 6
+
+We have many parties for each election. We will only be interested in the parties:
+
+-   PSOE: contains "PARTIDO SOCIALISTA OBRERO ESPAÑOL", "PARTIT DELS SOCIALISTES DE CATALUNYA", "PARTIDO SOCIALISTA DE EUSKADI" or "PARTIDO DOS SOCIALISTAS DE GALICIA"
+
+-   PP: contains "PARTIDO POPULAR"
+
+-   UP: contains "PODEMOS" or "EN COMÚ PODEM"
+
+-   VOX: contains "VOX"
+
+-   CS: contains "CIUDADANOS" or "CIUTADANS"
+
+-   ERC: contains "ESQUERRA REPUBLICANA DE CATALUNYA"
+
+-   BILDU: contains "EUSKAL HERRIA BILDU"
+
+-   PNV: contains "PARTIDO NACIONALISTA VASCO"
+
+> Create a variable with grouping by the acronyms, taking into account that everything that is not one of the previous parties should be coded as `"OTHERS"`. After the recoding, remember to add the votes (for example, votes for "PARTIDO SOCIALISTA OBRERO ESPAÑOL" and "PARTIT DELS SOCIALISTES DE CATALUNYA" should be added together under the acronym PSOE).
+
+```{r}
+tidy_data4 <-
+  tidy_data3 |> 
+  mutate(acronym = case_when(
+    grepl("PARTIDO SOCIALISTA OBRERO ESPAÑOL", party) ~ "PSOE",
+    grepl("PARTIT DELS SOCIALISTES DE CATALUNYA", party) ~ "PSOE",
+    grepl("PARTIDO SOCIALISTA DE EUSKADI", party) ~ "PSOE",
+    grepl("PARTIDO DOS SOCIALISTAS DE GALICIA", party) ~ "PSOE",
+    grepl("PARTIDO POPULAR", party) ~ "PP",
+    grepl("PODEMOS", party) ~ "UP",
+    grepl("EN COMÚ PODEM", party) ~ "UP",
+    grepl("VOX", party) ~ "VOX",
+    grepl("CIUDADANOS", party) ~ "CS",
+    grepl("CIUTADANS", party) ~ "CS",
+    grepl("ESQUERRA REPUBLICANA DE CATALUNYA", party) ~ "ERC",
+    grepl("EUSKAL HERRIA BILDU", party) ~ "BILDU",
+    grepl("PARTIDO NACIONALISTA VASCO", party) ~ "PNV",
+    TRUE ~ "OTHERS" 
+  )) |> 
+  select(-party) |> 
+  relocate(acronym, .before = votes) |> 
+  mutate(votes = sum(votes), .by = c(date, id_mun, acronym)) |> 
+  mutate(acronym = as.factor(acronym))
+```
+
+> After that, it converts the acronym as a qualitative variable (factor) in the most appropriate way
+
+### Exercise 7
+
+> It incorporates as a new variable the percentage of votes of each party (in each election, in each municipality). The percentage is computed as party votes divided by valid votes (valid votes = party votes + blank votes).
+
+```{r}
+tidy_data5 <-
+  tidy_data4 |>
+  group_by(date, id_mun, acronym) |> 
+  mutate(percent = 100*votes / (votos_blancos + votos_nulos + votos_candidaturas))
+            
+            
+```
+
+### Exercise 8
+
+> Considering only the data from the last available elections, select the two winning parties in each municipality.
+
+```{r}
+tidy_data5 |> 
+  slice_max(date) |>
+  slice_max(n = 2, percent, by = id_mun)
+  
+  # filter(date == "2019-04-01" | date == "2019-11-01") |> 
+  # group_by(date, codigo_municipio, acronym) |> mutate(sum = sum(votes)) |> group_by(date, codigo_municipio) |> mutate(valid_votes = sum + votos_blancos) |> mutate(percent = sum/valid_votes*100) |> slice_max(acronym, n=2) |> select(date, codigo_municipio, acronym, percent)
+```
+
+### Exercise 9
+
+> Calculate the total votes of each party by province, for each election. Do the same for each autonomous community. Do the same for the whole of Spain
+
+```{r}
+tidy_data5 |>
+  group_by(date, codigo_provincia, acronym) |> summarise(sum_vote = sum(votes))
+
+tidy_data5 |> group_by(date, codigo_ccaa, acronym) |> summarise(sum_vote = sum(votes))
+
+tidy_data5 |> group_by(date, acronym) |> summarise(sum_vote = sum(votes))
+```
+
+### Exercise 10
+
+> Who won in the 7 most populated cities in Spain in each election?
+
+```{r}
+tidy_data5 |> select(id_mun, censo, acronym, votes, date) |> 
+  distinct(date, id_mun, .keep_all = TRUE) |> slice_max(censo, n=7) |> 
+  slice_max(percent)
+
+
+```

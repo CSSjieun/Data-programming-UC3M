@@ -1,0 +1,689 @@
+---
+title: "Group Task"
+author: 
+format:
+  revealjs:
+    theme: moon
+    incremental: true
+    width: 1920
+    height: 1080
+editor: visual
+---
+
+## Required packages {visibility="hidden"}
+
+Insert in the lower chunk the packages you will need
+
+```{r}
+
+rm(list = ls()) 
+library(tidyverse)
+library(dbplyr)
+library(RSQLite)
+library(DBI)
+library(lubridate)
+library(scales)
+library(glue)
+library(ggplot2)
+library(forcats)
+```
+
+## Required packages
+
+-   tidyverse
+-   dbplyr
+-   RSQLite
+-   DBI
+-   lubridate
+-   scales
+-   glue
+-   forcats
+-   ggplot2
+
+# About the data
+
+## Original data {visibility="hidden"}
+
+```{r}
+if(!file.exists("database.sqlite")) {
+  #Original data files
+  election_data <- read_csv(file = "./data/datos_elecciones_brutos.csv")
+  cod_mun <- read_csv(file = "./data/cod_mun.csv")
+  surveys <- read_csv(file = "./data/historical_surveys.csv")
+  abbrev <- read_csv(file = "./data/siglas.csv")
+  
+  #Pivoted election_data table name: election_data
+  election_df <- election_data %>% 
+    pivot_longer(cols = !tipo_eleccion:votos_candidaturas, names_to = 'party', values_to = 'vote_count') %>% 
+    select(-tipo_eleccion, -vuelta, -codigo_distrito_electoral) %>% #column with 0 variance
+    mutate(vote_count = replace_na(vote_count, 0),
+           cod_mun = glue('{codigo_ccaa}-{codigo_provincia}-{codigo_municipio}'), .after = codigo_municipio) 
+  
+  #Municipal population table
+  municipal_population <- election_data %>% 
+    mutate(cod_mun = glue('{codigo_ccaa}-{codigo_provincia}-{codigo_municipio}'), .after = codigo_municipio) %>% 
+    select(anno, mes, cod_mun, censo) %>% 
+    summarise(sum(censo), .by = c(cod_mun, anno, mes)) %>% 
+    rename('censo_total' = 'sum(censo)')
+  
+  #Pivoted surveys table name: surveys
+  surveys_df <- surveys %>% 
+    pivot_longer(cols = !type_survey:turnout, names_to = 'siglas', values_to = 'estimated_voting_intention') %>% 
+    mutate(date_elec = as.character(date_elec),
+           field_date_from = as.character(field_date_from),
+           field_date_to = as.character(field_date_to)) 
+  
+  #Migrate data to sqlite database
+  db_file <- "database.sqlite"
+  src_sqlite(db_file, create = TRUE) #Create database
+  db <- DBI::dbConnect(SQLite(), "database.sqlite", extended_types = T) #Connect to sqlite database
+  
+  dbWriteTable(db, "election_data", election_df, field.types = c(anno = "Int"))
+  dbWriteTable(db, "municipal_population", municipal_population)
+  dbWriteTable(db, "cod_mun", cod_mun)
+  dbWriteTable(db, "surveys", surveys_df, field.types = c(date_elec = "Date", field_date_from ="Date", field_date_to = "Date"))
+  dbWriteTable(db, "abbrev", abbrev)
+  
+  #Filtered surveys table for ease of querying
+  dbSendQuery(db, "CREATE TABLE surveys_new AS
+  SELECT *
+  FROM surveys
+  WHERE date_elec >= '2018-01-01'
+   AND exit_poll = 0
+   AND size >= 750
+   AND JULIANDAY(field_date_to) - JULIANDAY(field_date_from) > 1;
+  ")
+  
+  #Add missing parties in abbrev table 
+  dbSendQuery(db, "INSERT INTO abbrev(denominacion)
+  SELECT DISTINCT party
+  FROM election_data 
+  WHERE party NOT IN (SELECT denominacion FROM abbrev);")
+  
+  #Processed party names and abbreviation
+  dbSendQuery(db, "CREATE TABLE abbrev_2 AS
+  SELECT DISTINCT denominacion, 
+      CASE 
+          WHEN siglas LIKE '%PSOE%' OR siglas LIKE 'P.S.O.E.' OR denominacion LIKE '%PSOE%' THEN 'PSOE'
+          WHEN siglas LIKE '%P.P.%' OR denominacion LIKE '%PARTIDO POPULAR%' THEN 'PP'
+          WHEN denominacion LIKE '%PARTIDO DE LA CIUDADAN_A%'  THEN 'CS'
+          WHEN denominacion LIKE '%VASCO%' THEN 'EAJ'
+          WHEN denominacion LIKE '%NACIONALISTA GALEGO%' THEN 'BNG'
+          WHEN siglas LIKE '%COMPRO%' THEN 'COM'
+          WHEN denominacion LIKE '%UNIÓ' OR siglas = 'CIU' THEN 'CIU'
+          WHEN denominacion LIKE '%ESQUE    RRA REPUBLICANA%' AND denominacion NOT LIKE '%VALENCI%' THEN 'ERC'
+          WHEN denominacion LIKE '%BILDU%'  OR denominacion LIKE '%Aralar%' OR denominacion LIKE '%Eusko%' THEN 'EH-BILDU'
+          WHEN denominacion LIKE '%los verdes%' OR denominacion LIKE '%podem%' OR denominacion LIKE '%ezker batua%' OR denominacion LIKE '%IZQUIERDA UNIDA%' THEN 'UP-IU'
+          WHEN denominacion LIKE '%MÁS PAÍS%' THEN'MP'
+          WHEN denominacion LIKE '%VOX%' THEN 'VOX'
+          ELSE 'OTHER'
+      END AS siglas_2
+  FROM abbrev;")
+  
+  #New election data filtered and processed date
+  dbSendQuery(db, "CREATE TABLE election_data_2 AS
+  SELECT 
+      (anno || '-' || mes || '-' || '01') AS elec_date,
+      cod_mun,numero_mesas, participacion_1, participacion_2,
+      votos_blancos, votos_nulos, votos_candidaturas, party, vote_count
+  FROM election_data;")
+  
+  rm(list=ls())
+}
+```
+
+## Data
+
+```{r}
+#| echo: true
+db <- DBI::dbConnect(SQLite(), "database.sqlite", extended_types = T)
+```
+
+Due to the large size of the pivoted **`election_data`** dataframe (22 million rows), handling it became computationally intensive. To optimize efficiency, we migrated the data to a SQL database, enabling selective retrieval of necessary tables and reducing the load on the R environment.
+
+![](meme1.jpg){fig-align="center"}
+
+# The Analysis
+
+## Distribution of national parties vs regional
+
+1.How is the vote of national parties (PSOE, PP, VOX, CS, MP, UP - IU) distributed against regional or nationalist parties?
+
+```{r}
+#Create a table in sql db for faster data retrieval
+if(!dbListTables(db) %>% str_detect("vote_sum") %>% any()) {
+  q1_df <- tbl(db, "election_data_2") %>% 
+  select(cod_mun, elec_date, party, vote_count) %>% 
+  left_join(tbl(db, "abbrev_2"), by = join_by("party" == "denominacion")) %>% 
+  mutate(nat_reg = ifelse(siglas_2 %in% c('PSOE', 'PP','VOX', 'CS', 'MP', 'UP-IU'),'national', 'regional'))
+  
+  vote_sum <- q1_df %>% 
+    group_by(nat_reg, elec_date) %>% 
+    summarise(vote_total = sum(vote_count)) 
+  vote_sum %>% head()
+  compute(vote_sum, temporary = FALSE, name='vote_sum')
+}
+```
+
+::: columns
+::: {.column width="50%" style="align: center"}
+```{r}
+#| fig-height: 7
+#| fig-width : 13
+plot1_data <- tbl(db, "vote_sum") 
+ggplot(plot1_data, aes(x = elec_date, y = vote_total/10^6, fill = nat_reg)) +
+  geom_col(position = position_dodge2()) +
+  labs( title = "Vote Distribution: National vs. Regional/ Nationalist Parties",
+  subtitle = "Analysis of votes for national parties (PSOE, PP, VOX, CS, MP, UP-IU) compared to regional or nationalist parties",
+  x = "Election Date",
+  y = "Total Votes (in millions)",
+  fill = NULL
+  ) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 12),
+    axis.text.y = element_text(size = 10),
+    axis.text.x = element_text(size = 10)
+  )
+
+
+
+```
+:::
+
+::: {.column width="30%" style="align: center"}
+### Table
+
+```{r}
+tbl(db, "vote_sum") %>% collect() %>% tibble()
+```
+:::
+:::
+
+::: {style="text-align: center"}
+National parities largely outweigh regional parties in votes. However, notable surges in votes for regional parties during certain elections, such as in 2011, suggest there were impactful events occurring between elections.
+:::
+
+## Dominant Political Parties in Municipalities
+
+2.Which party was the winner in the municipalities with more than 100,000 habitants (census) in each of the elections?
+
+```{r}
+#Create another table for ease of computing
+if(!dbListTables(db) %>% str_detect("vote_full") %>% any()) {
+    vote_full <- tbl(db, "election_data_2") %>% 
+      group_by(elec_date, cod_mun) %>% 
+      mutate(valid_votes = sum(vote_count) + votos_blancos,
+             percent = vote_count/ valid_votes * 100) %>% 
+    select(elec_date, cod_mun, party, vote_count, valid_votes, percent)
+    compute(vote_full, temporary = FALSE, name = "vote_full")
+}
+```
+
+```{r}
+mun_pop_2 <- tbl(db, "municipal_population") %>% 
+  mutate(date = paste(as.integer(anno), mes, "01", sep = "-" )) %>% 
+  select(-anno, -mes) 
+
+winner_100k <- tbl(db, "vote_full") %>% 
+  left_join(mun_pop_2, by = join_by("cod_mun", "elec_date" == "date")) %>% 
+  filter(censo_total > 100000) %>% 
+  group_by(elec_date, cod_mun) %>% 
+  filter(percent == max(percent)) %>% 
+  ungroup() %>% 
+  collect()
+```
+
+```{r}
+#Helper function to look for winner of a certain year
+winner <- function(elec) {
+ return(
+   winner_100k %>% 
+     filter(elec_date == elec) %>% 
+     group_by(party) %>% 
+     summarise(wins = n()) %>% 
+     slice_max(wins, n = 1)
+ ) 
+}
+```
+
+```{r}
+#| output: false
+
+#2008
+winner('2008-03-01')
+
+#2011
+winner('2011-11-01')
+
+#2015
+winner('2015-12-01')
+
+#2016
+winner('2016-06-01')
+
+#2019-1
+winner('2019-04-01')
+
+#2019-2
+winner('2019-11-01')
+```
+
+```{r}
+#Summary data frame to make the plot
+winner_100k_summary <- winner_100k %>% 
+  group_by(elec_date, party) %>% 
+  summarise(wins = n()) %>% 
+  filter(wins == max(wins)) %>% 
+  left_join(tbl(db, "abbrev_2") %>% collect(), by = join_by("party" == "denominacion")) 
+```
+
+::: {style="text-align: center"}
+```{r}
+party_colors <- c("PP" = "#0157a1", "PSOE" = "#f20400")
+
+ggplot(winner_100k_summary) +
+  geom_col(aes(x = elec_date, y = wins, fill = siglas_2)) +
+  geom_text(aes(x = elec_date, y = wins, label = siglas_2), nudge_y = 1) +
+  scale_fill_manual(values = party_colors) +  
+  labs(
+    title = "Election Winners in Cities Over 100k Inhabitants",
+    subtitle = "Comparative wins of PP and PSOE across multiple elections",
+    x = "Election Date",
+    y = "Number of Wins",
+    fill = "Party"
+  ) + 
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 12)
+  )
+
+```
+:::
+
+::: {style="text-align: center"}
+In larger municipalities, PP and PSOE predominantly emerge as the winning parties
+:::
+
+| \## Primary Runner-Up Parties to PSOE and PP in Elections: Bipartidism Who?                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+|-----|
+| `f3175f2a-e8a0-4436-be12-b33925b6d220 31b8e172-b470-440e-83d8-e6b185028602:dAB5AHAAZQA6AFoAZwBBAHoAQQBEAEUAQQBOAHcAQQAxAEEARwBZAEEATQBnAEIAaABBAEMAMABBAFoAUQBBADQAQQBHAEUAQQBNAEEAQQB0AEEARABRAEEATgBBAEEAegBBAEQAWQBBAEwAUQBCAGkAQQBHAFUAQQBNAFEAQQB5AEEAQwAwAEEAWQBnAEEAegBBAEQATQBBAE8AUQBBAHkAQQBEAFUAQQBZAGcAQQAyAEEARwBRAEEATQBnAEEAeQBBAEQAQQBBAAoAcABvAHMAaQB0AGkAbwBuADoATQBRAEEAeABBAEQASQBBAE4AdwBBADEAQQBBAD0APQAKAHAAcgBlAGYAaQB4ADoACgBzAG8AdQByAGMAZQA6AFkAQQBCAGcAQQBHAEEAQQBlAHcAQgB5AEEASAAwAEEAQwBnAEIAbgBBAEcAYwBBAGMAQQBCAHMAQQBHADgAQQBkAEEAQQBvAEEARwBZAEEAYQBRAEIAeQBBAEgATQBBAGQAQQBCAGYAQQBIAEEAQQBjAHcAQgB2AEEARwBVAEEATABBAEEAZwBBAEcARQBBAFoAUQBCAHoAQQBDAGcAQQBlAFEAQQBnAEEARAAwAEEASQBBAEIAeQBBAEcAVQBBAGIAdwBCAHkAQQBHAFEAQQBaAFEAQgB5AEEAQwBnAEEAWgBRAEIAcwBBAEcAVQBBAFkAdwBCAGYAQQBHAFEAQQBZAFEAQgAwAEEARwBVAEEATABBAEEAZwBBAEcAUQBBAFoAUQBCAHoAQQBHAE0AQQBLAEEAQgBsAEEARwB3AEEAWgBRAEIAagBBAEYAOABBAFoAQQBCAGgAQQBIAFEAQQBaAFEAQQBwAEEAQwBrAEEATABBAEEAZwBBAEEAbwBBAEkAQQBBAGcAQQBDAEEAQQBJAEEAQQBnAEEAQwBBAEEASQBBAEEAZwBBAEMAQQBBAEkAQQBBAGcAQQBDAEEAQQBJAEEAQQBnAEEAQwBBAEEASQBBAEEAZwBBAEMAQQBBAEkAQQBBAGcAQQBDAEEAQQBlAEEAQQBnAEEARAAwAEEASQBBAEIAagBBAEcAOABBAGQAUQBCAHUAQQBIAFEAQQBYAHcAQgB6AEEARwBVAEEAWQB3AEIAdgBBAEcANABBAFoAQQBBAHMAQQBDAEEAQQBaAGcAQgBwAEEARwB3AEEAYgBBAEEAZwBBAEQAMABBAEkAQQBCAHoAQQBHAFUAQQBZAHcAQgB2AEEARwA0AEEAWgBBAEEAcABBAEMAawBBAEkAQQBBAHIAQQBBAG8AQQBJAEEAQQBnAEEARwBjAEEAWgBRAEIAdgBBAEcAMABBAFgAdwBCAGkAQQBHAEUAQQBjAGcAQQBvAEEASABNAEEAZABBAEIAaABBAEgAUQBBAEkAQQBBADkAQQBDAEEAQQBJAGcAQgBwAEEARwBRAEEAWgBRAEIAdQBBAEgAUQBBAGEAUQBCADAAQQBIAGsAQQBJAGcAQQBzAEEAQwBBAEEAYwBBAEIAdgBBAEgATQBBAGEAUQBCADAAQQBHAGsAQQBiAHcAQgB1AEEAQwBBAEEAUABRAEEAZwBBAEMASQBBAGEAUQBCAGsAQQBHAFUAQQBiAGcAQgAwAEEARwBrAEEAZABBAEIANQBBAEMASQBBAEwAQQBBAGcAQQBIAGMAQQBhAFEAQgBrAEEASABRAEEAYQBBAEEAZwBBAEQAMABBAEkAQQBBAHcAQQBDADQAQQBOAHcAQQBwAEEAQwBBAEEASwB3AEEASwBBAEMAQQBBAEkAQQBCAHoAQQBHAE0AQQBZAFEAQgBzAEEARwBVAEEAWAB3AEIAbQBBAEcAawBBAGIAQQBCAHMAQQBGADgAQQBiAFEAQgBoAEEARwA0AEEAZABRAEIAaABBAEcAdwBBAEsAQQBCADIAQQBHAEUAQQBiAEEAQgAxAEEARwBVAEEAYwB3AEEAZwBBAEQAMABBAEkAQQBCAGoAQQBDAGcAQQBJAGcAQgBRAEEARgBBAEEASQBnAEEAZwBBAEQAMABBAEkAQQBBAGkAQQBDAE0AQQBNAEEAQQB4AEEARABVAEEATgB3AEIAaABBAEQARQBBAEkAZwBBAHMAQQBDAEEAQQBJAGcAQgBWAEEARgBBAEEATABRAEIASgBBAEYAVQBBAEkAZwBBAGcAQQBEADAAQQBJAEEAQQBpAEEAQwBNAEEATgBnAEEAMgBBAEQATQBBAE0AZwBBADMAQQBEAGcAQQBJAGcAQQBwAEEAQwBrAEEASQBBAEEAcgBBAEEAbwBBAEMAZwBBAGcAQQBDAEEAQQBiAEEAQgBoAEEARwBJAEEAYwB3AEEAbwBBAEgAZwBBAFAAUQBBAGkAQQBDAEkAQQBMAEEAQQBnAEEASABrAEEAUABRAEEAaQBBAEMASQBBAEwAQQBBAGcAQQBIAFEAQQBhAFEAQgAwAEEARwB3AEEAWgBRAEEAOQBBAEMAQQBBAEkAZwBCAFQAQQBHAFUAQQBZAHcAQgB2AEEARwA0AEEAWgBBAEEAZwBBAEgAQQBBAFkAUQBCAHkAQQBIAFEAQQBlAFEAQQBnAEEASABjAEEAYQBBAEIAbABBAEcANABBAEkAQQBCADAAQQBHAGcAQQBaAFEAQQBnAEEASABjAEEAYQBRAEIAdQBBAEcANABBAFoAUQBCAHkAQQBDAEEAQQBhAFEAQgB6AEEAQwBBAEEAVQBBAEIAVABBAEUAOABBAFIAUQBBAGkAQQBDAHcAQQBJAEEAQgB6AEEASABVAEEAWQBnAEIAMABBAEcAawBBAGQAQQBCAHMAQQBHAFUAQQBJAEEAQQA5AEEAQwBBAEEASQBnAEIAMABBAEcAOABBAGQAQQBCAGgAQQBHAHcAQQBJAEEAQgB1AEEATABvAEEASQBBAEIAdgBBAEcAWQBBAEkAQQBCADIAQQBHADgAQQBkAEEAQgBsAEEASABNAEEASQBBAEIAdwBBAEcAVQBBAGMAZwBBAGcAQQBHAFUAQQBiAEEAQgBsAEEARwBNAEEAZABBAEIAcABBAEcAOABBAGIAZwBBAGcAQQBHAGsAQQBiAGcAQQBnAEEARwAwAEEAZABRAEIAdQBBAEcAawBBAFkAdwBCAHAAQQBIAEEAQQBZAFEAQgBzAEEARwBrAEEAZABBAEIAbABBAEgATQBBAEkAQQBCADMAQQBHAGsAQQBkAEEAQgBvAEEAQwBBAEEAYgBRAEIAdgBBAEgASQBBAFoAUQBBAGcAQQBIAFEAQQBhAEEAQgBoAEEARwA0AEEASQBBAEEAeABBAEQAQQBBAE0AQQBBAHUAQQBEAEEAQQBNAEEAQQB3AEEAQwBBAEEAYQBRAEIAdQBBAEcAZwBBAFkAUQBCAGkAQQBHAGsAQQBkAEEAQgBoAEEARwA0AEEAZABBAEIAegBBAEMASQBBAEsAUQBBAGcAQQBDAHMAQQBDAGcAQQBnAEEAQwBBAEEAZABBAEIAbwBBAEcAVQBBAGIAUQBCAGwAQQBGADgAQQBiAFEAQgBwAEEARwA0AEEAYQBRAEIAdABBAEcARQBBAGIAQQBBAG8AQQBDAGsAQQBJAEEAQQByAEEAQQBvAEEASQBBAEEAZwBBAEgAUQBBAGEAQQBCAGwAQQBHADAAQQBaAFEAQQBvAEEAQQBvAEEASQBBAEEAZwBBAEMAQQBBAEkAQQBCAHcAQQBHAHcAQQBiAHcAQgAwAEEAQwA0AEEAZABBAEIAcABBAEgAUQBBAGIAQQBCAGwAQQBDAEEAQQBQAFEAQQBnAEEARwBVAEEAYgBBAEIAbABBAEcAMABBAFoAUQBCAHUAQQBIAFEAQQBYAHcAQgAwAEEARwBVAEEAZQBBAEIAMABBAEMAZwBBAFoAZwBCAGgAQQBHAE0AQQBaAFEAQQBnAEEARAAwAEEASQBBAEEAaQBBAEcASQBBAGIAdwBCAHMAQQBHAFEAQQBJAGcAQQBzAEEAQwBBAEEAYwB3AEIAcABBAEgAbwBBAFoAUQBBAGcAQQBEADAAQQBJAEEAQQB4AEEARABRAEEATABBAEEAZwBBAEcAZwBBAGEAZwBCADEAQQBIAE0AQQBkAEEAQQBnAEEARAAwAEEASQBBAEEAdwBBAEMAawBBAEwAQQBBAEsAQQBDAEEAQQBJAEEAQQBnAEEAQwBBAEEAYwBBAEIAcwBBAEcAOABBAGQAQQBBAHUAQQBIAE0AQQBkAFEAQgBpAEEASABRAEEAYQBRAEIAMABBAEcAdwBBAFoAUQBBAGcAQQBEADAAQQBJAEEAQgBsAEEARwB3AEEAWgBRAEIAdABBAEcAVQBBAGIAZwBCADAAQQBGADgAQQBkAEEAQgBsAEEASABnAEEAZABBAEEAbwBBAEcAWQBBAFkAUQBCAGoAQQBHAFUAQQBJAEEAQQA5AEEAQwBBAEEASQBnAEIAcABBAEgAUQBBAFkAUQBCAHMAQQBHAGsAQQBZAHcAQQBpAEEAQwB3AEEASQBBAEIAegBBAEcAawBBAGUAZwBCAGwAQQBDAEEAQQBQAFEAQQBnAEEARABFAEEATQBnAEEAcwBBAEMAQQBBAGEAQQBCAHEAQQBIAFUAQQBjAHcAQgAwAEEAQwBBAEEAUABRAEEAZwBBAEQAQQBBAEsAUQBBAHMAQQBBAG8AQQBJAEEAQQBnAEEAQwBBAEEASQBBAEIAcwBBAEcAVQBBAFoAdwBCAGwAQQBHADQAQQBaAEEAQQB1AEEASABBAEEAYgB3AEIAegBBAEcAawBBAGQAQQBCAHAAQQBHADgAQQBiAGcAQQBnAEEARAAwAEEASQBBAEEAaQBBAEcASQBBAGIAdwBCADAAQQBIAFEAQQBiAHcAQgB0AEEAQwBJAEEATABBAEEASwBBAEMAQQBBAEkAQQBBAGcAQQBDAEEAQQBiAEEAQgBsAEEARwBjAEEAWgBRAEIAdQBBAEcAUQBBAEwAZwBCADAAQQBHAGsAQQBkAEEAQgBzAEEARwBVAEEAUABRAEIAbABBAEcAdwBBAFoAUQBCAHQAQQBHAFUAQQBiAGcAQgAwAEEARgA4AEEAWQBnAEIAcwBBAEcARQBBAGIAZwBCAHIAQQBDAGcAQQBLAFEAQQBzAEEAQQBvAEEASQBBAEEAZwBBAEMAQQBBAEkAQQBCAGgAQQBIAGcAQQBhAFEAQgB6AEEAQwA0AEEAZABBAEIAbABBAEgAZwBBAGQAQQBBAHUAQQBIAGsAQQBJAEEAQQA5AEEAQwBBAEEAWgBRAEIAcwBBAEcAVQBBAGIAUQBCAGwAQQBHADQAQQBkAEEAQgBmAEEASABRAEEAWgBRAEIANABBAEgAUQBBAEsAQQBCAHoAQQBHAGsAQQBlAGcAQgBsAEEAQwBBAEEAUABRAEEAZwBBAEQARQBBAE0AQQBBAHAAQQBDAHcAQQBDAGcAQQBnAEEAQwBBAEEASQBBAEEAZwBBAEcARQBBAGUAQQBCAHAAQQBIAE0AQQBMAGcAQgAwAEEARwBVAEEAZQBBAEIAMABBAEMANABBAGUAQQBBAGcAQQBEADAAQQBJAEEAQgBsAEEARwB3AEEAWgBRAEIAdABBAEcAVQBBAGIAZwBCADAAQQBGADgAQQBkAEEAQgBsAEEASABnAEEAZABBAEEAbwBBAEgATQBBAGEAUQBCADYAQQBHAFUAQQBJAEEAQQA5AEEAQwBBAEEATQBRAEEAdwBBAEMAawBBAEwAQQBBAEsAQQBDAEEAQQBJAEEAQQBnAEEAQwBBAEEAWQBRAEIANABBAEcAawBBAGMAdwBBAHUAQQBIAFEAQQBhAFEAQgAwAEEARwB3AEEAWgBRAEEAZwBBAEQAMABBAEkAQQBCAGwAQQBHAHcAQQBaAFEAQgB0AEEARwBVAEEAYgBnAEIAMABBAEYAOABBAFkAZwBCAHMAQQBHAEUAQQBiAGcAQgByAEEAQwBnAEEASwBRAEEAcwBBAEEAbwBBAEkAQQBBAGcAQQBDAEEAQQBJAEEAQgB3AEEARwBFAEEAYgBnAEIAbABBAEcAdwBBAEwAZwBCAG4AQQBIAEkAQQBhAFEAQgBrAEEAQwA0AEEAYgBRAEIAaABBAEcAbwBBAGIAdwBCAHkAQQBDADQAQQBlAFEAQQBnAEEARAAwAEEASQBBAEIAbABBAEcAdwBBAFoAUQBCAHQAQQBHAFUAQQBiAGcAQgAwAEEARgA4AEEAYgBBAEIAcABBAEcANABBAFoAUQBBAG8AQQBHAE0AQQBiAHcAQgBzAEEARwA4AEEAYwBnAEEAZwBBAEQAMABBAEkAQQBBAGkAQQBHAGMAQQBjAGcAQgBoAEEASABrAEEASQBnAEEAcwBBAEMAQQBBAGIAQQBCAHAAQQBHADQAQQBaAFEAQgAwAEEASABrAEEAYwBBAEIAbABBAEMAQQBBAFAAUQBBAGcAQQBDAEkAQQBaAEEAQgBoAEEASABNAEEAYQBBAEIAbABBAEcAUQBBAEkAZwBBAHMAQQBDAEEAQQBjAHcAQgBwAEEASABvAEEAWgBRAEEAZwBBAEQAMABBAEkAQQBBAHcAQQBDADQAQQBNAHcAQQBwAEEAQQBvAEEASQBBAEEAZwBBAEMAawBBAEkAQQBBAGcAQQBBAG8AQQBJAEEAQQBnAEEAQQBvAEEAWQBBAEIAZwBBAEcAQQBBAAoAcwB1AGYAZgBpAHgAOgA=:31b8e172-b470-440e-83d8-e6b185028602`                                                                                                                                                                                                                                                                                                                                                                                     |
+| ::: {style="text-align: center"} PP was the second party when PSOE was the winner in almost every election. UP-IU was the second party in the elections of 2015 after PSOE - 15M hitting. :::                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `f3175f2a-e8a0-4436-be12-b33925b6d220 31b8e172-b470-440e-83d8-e6b185028602:dAB5AHAAZQA6AFoAZwBBAHoAQQBEAEUAQQBOAHcAQQAxAEEARwBZAEEATQBnAEIAaABBAEMAMABBAFoAUQBBADQAQQBHAEUAQQBNAEEAQQB0AEEARABRAEEATgBBAEEAegBBAEQAWQBBAEwAUQBCAGkAQQBHAFUAQQBNAFEAQQB5AEEAQwAwAEEAWQBnAEEAegBBAEQATQBBAE8AUQBBAHkAQQBEAFUAQQBZAGcAQQAyAEEARwBRAEEATQBnAEEAeQBBAEQAQQBBAAoAcABvAHMAaQB0AGkAbwBuADoATQBRAEEAeQBBAEQATQBBAE4AZwBBAHcAQQBBAD0APQAKAHAAcgBlAGYAaQB4ADoACgBzAG8AdQByAGMAZQA6AFkAQQBCAGcAQQBHAEEAQQBlAHcAQgB5AEEASAAwAEEAQwBnAEEAagBBAEgAdwBBAEkAQQBCAHYAQQBIAFUAQQBkAEEAQgB3AEEASABVAEEAZABBAEEANgBBAEMAQQBBAFoAZwBCAGgAQQBHAHcAQQBjAHcAQgBsAEEAQQBvAEEAQwBnAEEAagBBAEUAWQBBAGEAUQBCAHkAQQBIAE0AQQBkAEEAQQBnAEEARwBrAEEAYwB3AEEAZwBBAEYAQQBBAFUAQQBBAEsAQQBDAE0AQQBRAHcAQgB2AEEASABVAEEAYgBnAEIAMABBAEMAQQBBAGEAQQBCAHYAQQBIAGMAQQBJAEEAQgB0AEEARwBFAEEAYgBnAEIANQBBAEMAQQBBAGQAQQBCAHAAQQBHADAAQQBaAFEAQgB6AEEAQwBBAEEAWgB3AEIAdgBBAEgAUQBBAEkAQQBCAHoAQQBHAFUAQQBZAHcAQgB2AEEARwA0AEEAWgBBAEEAZwBBAEgAQQBBAGIAQQBCAGgAQQBHAE0AQQBaAFEAQQBLAEEARwBZAEEAYQBRAEIAeQBBAEgATQBBAGQAQQBCAGYAQQBIAE0AQQBaAFEAQgBqAEEARwA4AEEAYgBnAEIAawBBAEMAQQBBAEoAUQBBACsAQQBDAFUAQQBJAEEAQQBLAEEAQwBBAEEASQBBAEIAbQBBAEcAawBBAGIAQQBCADAAQQBHAFUAQQBjAGcAQQBvAEEASABNAEEAYQBRAEIAbgBBAEcAdwBBAFkAUQBCAHoAQQBGADgAQQBNAGcAQgBiAEEARABFAEEAWABRAEEAZwBBAEQAMABBAFAAUQBBAGcAQQBDAEkAQQBVAEEAQgBRAEEAQwBJAEEASwBRAEEAZwBBAEMAVQBBAFAAZwBBAGwAQQBDAEEAQQBDAGcAQQBnAEEAQwBBAEEAWgBnAEIAcABBAEcAdwBBAGQAQQBCAGwAQQBIAEkAQQBLAEEAQgB6AEEARwBrAEEAWgB3AEIAcwBBAEcARQBBAGMAdwBCAGYAQQBEAEkAQQBJAEEAQQBoAEEARAAwAEEASQBBAEEAaQBBAEYAQQBBAFUAQQBBAGkAQQBDAGsAQQBJAEEAQQBsAEEARAA0AEEASgBRAEEAZwBBAEgAVQBBAGIAZwBCAG4AQQBIAEkAQQBiAHcAQgAxAEEASABBAEEASwBBAEEAcABBAEMAQQBBAEoAUQBBACsAQQBDAFUAQQBJAEEAQQBLAEEAQwBBAEEASQBBAEIAegBBAEcAVQBBAGIAQQBCAGwAQQBHAE0AQQBkAEEAQQBvAEEARwBVAEEAYgBBAEIAbABBAEcATQBBAFgAdwBCAGsAQQBHAEUAQQBkAEEAQgBsAEEAQwB3AEEASQBBAEIAdwBBAEcARQBBAGMAZwBCADAAQQBIAGsAQQBMAEEAQQBnAEEASABNAEEAYQBRAEIAbgBBAEcAdwBBAFkAUQBCAHoAQQBGADgAQQBNAGcAQQBzAEEAQwBBAEEAYwBBAEIAbABBAEgASQBBAFkAdwBCAGwAQQBHADQAQQBkAEEAQQBwAEEAQwBBAEEASgBRAEEAKwBBAEMAVQBBAEkAQQBBAEsAQQBDAEEAQQBJAEEAQgBuAEEASABJAEEAYgB3AEIAMQBBAEgAQQBBAFgAdwBCAGkAQQBIAGsAQQBLAEEAQgBsAEEARwB3AEEAWgBRAEIAagBBAEYAOABBAFoAQQBCAGgAQQBIAFEAQQBaAFEAQQBzAEEAQwBBAEEAYwB3AEIAcABBAEcAYwBBAGIAQQBCAGgAQQBIAE0AQQBYAHcAQQB5AEEAQwBrAEEASQBBAEEAbABBAEQANABBAEoAUQBBAGcAQQBBAG8AQQBJAEEAQQBnAEEASABNAEEAZABRAEIAdABBAEcAMABBAFkAUQBCAHkAQQBHAGsAQQBjAHcAQgBsAEEAQwBnAEEAWQB3AEIAdgBBAEgAVQBBAGIAZwBCADAAQQBDAEEAQQBQAFEAQQBnAEEARwA0AEEASwBBAEEAcABBAEMAawBBAEkAQQBBAGwAQQBEADQAQQBKAFEAQQBnAEEAQQBvAEEASQBBAEEAZwBBAEcARQBBAGMAZwBCAHkAQQBHAEUAQQBiAGcAQgBuAEEARwBVAEEASwBBAEIAbABBAEcAdwBBAFoAUQBCAGoAQQBGADgAQQBaAEEAQgBoAEEASABRAEEAWgBRAEEAcwBBAEMAQQBBAFoAQQBCAGwAQQBIAE0AQQBZAHcAQQBvAEEARwBNAEEAYgB3AEIAMQBBAEcANABBAGQAQQBBAHAAQQBDAGsAQQBDAGcAQQBLAEEAQwBNAEEAVQB3AEIAMQBBAEcAMABBAEkAQQBCADIAQQBHADgAQQBkAEEAQgBsAEEASABNAEEASQBBAEIAdwBBAEcAVQBBAGMAZwBBAGcAQQBHAFUAQQBiAEEAQgBsAEEARwBNAEEAZABBAEIAcABBAEcAOABBAGIAZwBBAGcAQQBHADgAQQBaAGcAQQBnAEEASABNAEEAWgBRAEIAagBBAEcAOABBAGIAZwBCAGsAQQBDAEEAQQBjAEEAQgBzAEEARwBFAEEAWQB3AEIAbABBAEMAQQBBAGMAQQBCAGgAQQBIAEkAQQBkAEEAQgA1AEEAQQBvAEEAWgBnAEIAcABBAEgASQBBAGMAdwBCADAAQQBGADgAQQBjAEEAQgB3AEEAQwBBAEEAUABBAEEAdABBAEMAQQBBAFoAZwBCAHAAQQBIAEkAQQBjAHcAQgAwAEEARgA4AEEAYwB3AEIAbABBAEcATQBBAGIAdwBCAHUAQQBHAFEAQQBJAEEAQQBsAEEARAA0AEEASgBRAEEAZwBBAEEAbwBBAEkAQQBBAGcAQQBIAE0AQQBkAFEAQgB0AEEARwAwAEEAWQBRAEIAeQBBAEcAawBBAGMAdwBCAGwAQQBDAGcAQQBaAGcAQgBwAEEASABJAEEAYwB3AEIAMABBAEMAQQBBAFAAUQBBAGcAQQBIAE0AQQBhAFEAQgBuAEEARwB3AEEAWQBRAEIAegBBAEYAOABBAE0AZwBCAGIAQQBEAEUAQQBYAFEAQQBzAEEAQQBvAEEASQBBAEEAZwBBAEMAQQBBAEkAQQBBAGcAQQBDAEEAQQBJAEEAQQBnAEEAQwBBAEEASQBBAEEAZwBBAEMAQQBBAGMAdwBCAGwAQQBHAE0AQQBiAHcAQgB1AEEARwBRAEEASQBBAEEAOQBBAEMAQQBBAGMAdwBCAHAAQQBHAGMAQQBiAEEAQgBoAEEASABNAEEAWAB3AEEAeQBBAEYAcwBBAE0AZwBCAGQAQQBDAHcAQQBDAGcAQQBnAEEAQwBBAEEASQBBAEEAZwBBAEMAQQBBAEkAQQBBAGcAQQBDAEEAQQBJAEEAQQBnAEEAQwBBAEEASQBBAEEASwBBAEMAQQBBAEkAQQBBAGcAQQBDAEEAQQBJAEEAQQBnAEEAQwBBAEEASQBBAEEAZwBBAEMAQQBBAEkAQQBBAGcAQQBDAEEAQQBkAGcAQgB2AEEASABRAEEAWgBRAEIAegBBAEYAOABBAFoAZwBCAHAAQQBIAEkAQQBjAHcAQgAwAEEAQwBBAEEAUABRAEEAZwBBAEgATQBBAGQAUQBCAHQAQQBDAGcAQQBkAGcAQgB2AEEASABRAEEAWgBRAEIAZgBBAEcATQBBAGIAdwBCADEAQQBHADQAQQBkAEEAQgBiAEEASABNAEEAYQBRAEIAbgBBAEcAdwBBAFkAUQBCAHoAQQBGADgAQQBNAGcAQQBnAEEARAAwAEEAUABRAEEAZwBBAEcAWQBBAGEAUQBCAHkAQQBIAE0AQQBkAEEAQgBkAEEAQwBrAEEATABBAEEASwBBAEMAQQBBAEkAQQBBAGcAQQBDAEEAQQBJAEEAQQBnAEEAQwBBAEEASQBBAEEAZwBBAEMAQQBBAEkAQQBBAGcAQQBDAEEAQQBkAGcAQgB2AEEASABRAEEAWgBRAEIAegBBAEYAOABBAGMAdwBCAGwAQQBHAE0AQQBiAHcAQgB1AEEARwBRAEEASQBBAEEAOQBBAEMAQQBBAGMAdwBCADEAQQBHADAAQQBLAEEAQgAyAEEARwA4AEEAZABBAEIAbABBAEYAOABBAFkAdwBCAHYAQQBIAFUAQQBiAGcAQgAwAEEARgBzAEEAYwB3AEIAcABBAEcAYwBBAGIAQQBCAGgAQQBIAE0AQQBYAHcAQQB5AEEAQwBBAEEAUABRAEEAOQBBAEMAQQBBAGMAdwBCAGwAQQBHAE0AQQBiAHcAQgB1AEEARwBRAEEAWABRAEEAcABBAEMAdwBBAEMAZwBBAGcAQQBDAEEAQQBJAEEAQQBnAEEAQwBBAEEASQBBAEEAZwBBAEMAQQBBAEkAQQBBAGcAQQBDAEEAQQBJAEEAQQB1AEEARwBjAEEAYwBnAEIAdgBBAEgAVQBBAGMAQQBCAHoAQQBDAEEAQQBQAFEAQQBnAEEAQwBjAEEAWgBBAEIAeQBBAEcAOABBAGMAQQBBAG4AQQBDAEEAQQBLAFEAQQBnAEEAQwBVAEEAUABnAEEAbABBAEMAQQBBAEMAZwBBAGcAQQBDAEEAQQBJAEEAQQBLAEEAQwBBAEEASQBBAEIAbQBBAEcAawBBAGIAQQBCADAAQQBHAFUAQQBjAGcAQQBvAEEARwBZAEEAYQBRAEIAeQBBAEgATQBBAGQAQQBBADkAQQBEADAAQQBJAEEAQQBpAEEARgBBAEEAVQBBAEEAaQBBAEMAawBBAEkAQQBBAGwAQQBEADQAQQBKAFEAQQBnAEEAQQBvAEEASQBBAEEAZwBBAEgAVQBBAGIAZwBCAG4AQQBIAEkAQQBiAHcAQgAxAEEASABBAEEASwBBAEEAcABBAEMAQQBBAEoAUQBBACsAQQBDAFUAQQBJAEEAQQBLAEEAQwBBAEEASQBBAEEAZwBBAEEAbwBBAEkAQQBBAGcAQQBHAGMAQQBjAGcAQgB2AEEASABVAEEAYwBBAEIAZgBBAEcASQBBAGUAUQBBAG8AQQBHAFUAQQBiAEEAQgBsAEEARwBNAEEAWAB3AEIAawBBAEcARQBBAGQAQQBCAGwAQQBDAHcAQQBJAEEAQgB6AEEARwBVAEEAWQB3AEIAdgBBAEcANABBAFoAQQBBAHMAQQBDAEEAQQBaAGcAQgBwAEEASABJAEEAYwB3AEIAMABBAEMAawBBAEkAQQBBAGwAQQBEADQAQQBKAFEAQQBnAEEAQQBvAEEASQBBAEEAZwBBAEgATQBBAGQAUQBCAHQAQQBHADAAQQBZAFEAQgB5AEEARwBrAEEAYwB3AEIAbABBAEMAZwBBAFkAdwBCAHYAQQBIAFUAQQBiAGcAQgAwAEEARgA4AEEAYwB3AEIAbABBAEcATQBBAGIAdwBCAHUAQQBHAFEAQQBJAEEAQQA5AEEAQwBBAEEAYwB3AEIAMQBBAEcAMABBAEsAQQBCADIAQQBHADgAQQBkAEEAQgBsAEEASABNAEEAWAB3AEIAegBBAEcAVQBBAFkAdwBCAHYAQQBHADQAQQBaAEEAQQBwAEEAQwB3AEEASQBBAEEASwBBAEMAQQBBAEkAQQBBAGcAQQBDAEEAQQBJAEEAQQBnAEEAQwBBAEEASQBBAEEAZwBBAEMAQQBBAEkAQQBBAGcAQQBHAE0AQQBiAHcAQgAxAEEARwA0AEEAZABBAEIAZgBBAEcAWQBBAGEAUQBCAHkAQQBIAE0AQQBkAEEAQQBnAEEARAAwAEEASQBBAEIAegBBAEgAVQBBAGIAUQBBAG8AQQBIAFkAQQBiAHcAQgAwAEEARwBVAEEAYwB3AEIAZgBBAEcAWQBBAGEAUQBCAHkAQQBIAE0AQQBkAEEAQQBwAEEAQwB3AEEASQBBAEEASwBBAEMAQQBBAEkAQQBBAGcAQQBDAEEAQQBJAEEAQQBnAEEAQwBBAEEASQBBAEEAZwBBAEMAQQBBAEkAQQBBAGcAQQBDADQAQQBaAHcAQgB5AEEARwA4AEEAZABRAEIAdwBBAEgATQBBAEkAQQBBADkAQQBDAEEAQQBKAHcAQgBrAEEASABJAEEAYgB3AEIAdwBBAEMAYwBBAEsAUQBBAGcAQQBDAFUAQQBQAGcAQQBsAEEAQwBBAEEAQwBnAEEAZwBBAEcAYwBBAGMAZwBCAHYAQQBIAFUAQQBjAEEAQgBmAEEARwBJAEEAZQBRAEEAbwBBAEcAVQBBAGIAQQBCAGwAQQBHAE0AQQBYAHcAQgBrAEEARwBFAEEAZABBAEIAbABBAEMAawBBAEkAQQBBAGwAQQBEADQAQQBKAFEAQQBnAEEAQQBvAEEASQBBAEIAbQBBAEcAawBBAGIAQQBCADAAQQBHAFUAQQBjAGcAQQBvAEEARwBNAEEAYgB3AEIAMQBBAEcANABBAGQAQQBCAGYAQQBIAE0AQQBaAFEAQgBqAEEARwA4AEEAYgBnAEIAawBBAEMAQQBBAFAAUQBBADkAQQBDAEEAQQBiAFEAQgBoAEEASABnAEEASwBBAEIAagBBAEcAOABBAGQAUQBCAHUAQQBIAFEAQQBYAHcAQgB6AEEARwBVAEEAWQB3AEIAdgBBAEcANABBAFoAQQBBAHAAQQBDAGsAQQBDAGcAQgBnAEEARwBBAEEAWQBBAEEAPQAKAHMAdQBmAGYAaQB4ADoA:31b8e172-b470-440e-83d8-e6b185028602` |
+
+```{r}
+ggplot(first_pp, aes(y = reorder(elec_date, desc(elec_date)), 
+                     x = count_second, fill = second)) +
+  
+  geom_bar(stat = "identity", position = "identity", width = 0.7) +
+  scale_fill_manual(values = c("PSOE" = "#f20400", "UP-IU" = "#663278")) +
+  theme_minimal() +
+  labs(x="", y="", title= "Second party when the winner is PP", subtitle = "total nº of votes per election in municipalites with more than 100.000 inhabitants") +
+   theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0),
+    plot.subtitle = element_text(face = "italic", size = 12, hjust = 0),
+    legend.position = "bottom",
+    legend.title=element_blank(),
+    axis.text.y = element_text(size = 10),
+    axis.text.x = element_text(size = 10),
+    axis.title = element_blank(),
+    panel.grid.major.y = element_line(color = "gray", linetype = "dashed", size = 0.3)
+  ) 
+```
+
+::: {style="text-align: center"}
+PSOE was the second party when PP was the winner in almost every election. UP-IU was the second party in the elections of 2015 and 2016 after PP - 15M hitting.
+:::
+
+|                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+|-----|
+| \## Impact of Voter Turnout on Election Outcomes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| 4.Who benefits from low turnout?                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `f3175f2a-e8a0-4436-be12-b33925b6d220 31b8e172-b470-440e-83d8-e6b185028602:dAB5AHAAZQA6AFoAZwBBAHoAQQBEAEUAQQBOAHcAQQAxAEEARwBZAEEATQBnAEIAaABBAEMAMABBAFoAUQBBADQAQQBHAEUAQQBNAEEAQQB0AEEARABRAEEATgBBAEEAegBBAEQAWQBBAEwAUQBCAGkAQQBHAFUAQQBNAFEAQQB5AEEAQwAwAEEAWQBnAEEAegBBAEQATQBBAE8AUQBBAHkAQQBEAFUAQQBZAGcAQQAyAEEARwBRAEEATQBnAEEAeQBBAEQAQQBBAAoAcABvAHMAaQB0AGkAbwBuADoATQBRAEEAMABBAEQAUQBBAE8AQQBBADAAQQBBAD0APQAKAHAAcgBlAGYAaQB4ADoACgBzAG8AdQByAGMAZQA6AFkAQQBCAGcAQQBHAEEAQQBlAHcAQgB5AEEASAAwAEEAQwBnAEIAcwBBAEcAOABBAGQAdwBCADAAQQBIAFUAQQBjAGcAQgB1AEEARwA4AEEAZABRAEIAMABBAEMAQQBBAFAAQQBBAHQAQQBDAEEAQQBkAEEAQgBpAEEARwB3AEEASwBBAEIAawBBAEcASQBBAEwAQQBBAGkAQQBHAFUAQQBiAEEAQgBsAEEARwBNAEEAZABBAEIAcABBAEcAOABBAGIAZwBCAGYAQQBHAFEAQQBZAFEAQgAwAEEARwBFAEEAWAB3AEEAeQBBAEMASQBBAEsAUQBBAGcAQQBDAFUAQQBQAGcAQQBsAEEAQwBBAEEAQwBnAEEAZwBBAEMAQQBBAGIAQQBCAGwAQQBHAFkAQQBkAEEAQgBmAEEARwBvAEEAYgB3AEIAcABBAEcANABBAEsAQQBCADAAQQBHAEkAQQBiAEEAQQBvAEEARwBRAEEAWQBnAEEAcwBBAEMAQQBBAEkAZwBCAGgAQQBHAEkAQQBZAGcAQgB5AEEARwBVAEEAZABnAEIAZgBBAEQASQBBAEkAZwBBAHAAQQBDAHcAQQBZAGcAQgA1AEEAQwBBAEEAUABRAEEAZwBBAEcAbwBBAGIAdwBCAHAAQQBHADQAQQBYAHcAQgBpAEEASABrAEEASwBBAEEAaQBBAEgAQQBBAFkAUQBCAHkAQQBIAFEAQQBlAFEAQQBpAEEAQwBBAEEAUABRAEEAOQBBAEMAQQBBAEkAZwBCAGsAQQBHAFUAQQBiAGcAQgB2AEEARwAwAEEAYQBRAEIAdQBBAEcARQBBAFkAdwBCAHAAQQBHADgAQQBiAGcAQQBpAEEAQwBrAEEASwBRAEEAZwBBAEMAVQBBAFAAZwBBAGwAQQBDAEEAQQBDAGcAQQBnAEEAQwBBAEEAYgBBAEIAbABBAEcAWQBBAGQAQQBCAGYAQQBHAG8AQQBiAHcAQgBwAEEARwA0AEEASwBBAEIAdABBAEgAVQBBAGIAZwBCAGYAQQBIAEEAQQBiAHcAQgB3AEEARgA4AEEATQBnAEEAcwBBAEMAQQBBAFkAZwBCADUAQQBDAEEAQQBQAFEAQQBnAEEARwBvAEEAYgB3AEIAcABBAEcANABBAFgAdwBCAGkAQQBIAGsAQQBLAEEAQQBpAEEARwBNAEEAYgB3AEIAawBBAEYAOABBAGIAUQBCADEAQQBHADQAQQBJAGcAQQBzAEEAQwBBAEEASQBnAEIAbABBAEcAdwBBAFoAUQBCAGoAQQBGADgAQQBaAEEAQgBoAEEASABRAEEAWgBRAEEAaQBBAEMAQQBBAFAAUQBBADkAQQBDAEEAQQBJAGcAQgBrAEEARwBFAEEAZABBAEIAbABBAEMASQBBAEsAUQBBAHAAQQBDAEEAQQBKAFEAQQArAEEAQwBVAEEASQBBAEEASwBBAEMAQQBBAEkAQQBCAG4AQQBIAEkAQQBiAHcAQgAxAEEASABBAEEAWAB3AEIAaQBBAEgAawBBAEsAQQBCAGwAQQBHAHcAQQBaAFEAQgBqAEEARgA4AEEAWgBBAEIAaABBAEgAUQBBAFoAUQBBAHMAQQBDAEEAQQBZAHcAQgB2AEEARwBRAEEAWAB3AEIAdABBAEgAVQBBAGIAZwBBAHAAQQBDAEEAQQBKAFEAQQArAEEAQwBVAEEASQBBAEEASwBBAEMAQQBBAEkAQQBCAHQAQQBIAFUAQQBkAEEAQgBoAEEASABRAEEAWgBRAEEAbwBBAEgAQQBBAFkAUQBCAHkAQQBIAFEAQQBhAFEAQgBqAEEARwBrAEEAYwBBAEIAaABBAEgAUQBBAGEAUQBCAHYAQQBHADQAQQBYAHcAQgB3AEEARwBNAEEAWgB3AEEAZwBBAEQAMABBAEkAQQBCAHcAQQBHAEUAQQBjAGcAQgAwAEEARwBrAEEAWQB3AEIAcABBAEgAQQBBAFkAUQBCAGoAQQBHAGsAQQBiAHcAQgB1AEEARgA4AEEATQBnAEEAdgBBAEcATQBBAFoAUQBCAHUAQQBIAE0AQQBiAHcAQgBmAEEASABRAEEAYgB3AEIAMABBAEcARQBBAGIAQQBBAGcAQQBDAG8AQQBJAEEAQQB4AEEARABBAEEATQBBAEEAcABBAEMAQQBBAEoAUQBBACsAQQBDAFUAQQBJAEEAQQBLAEEAQwBBAEEASQBBAEIAegBBAEcAVQBBAGIAQQBCAGwAQQBHAE0AQQBkAEEAQQBvAEEARwBVAEEAYgBBAEIAbABBAEcATQBBAFgAdwBCAGsAQQBHAEUAQQBkAEEAQgBsAEEAQwB3AEEASQBBAEIAagBBAEcAOABBAFoAQQBCAGYAQQBHADAAQQBkAFEAQgB1AEEAQwB3AEEASQBBAEIAdwBBAEcARQBBAGMAZwBCADAAQQBIAGsAQQBMAEEAQQBnAEEASABNAEEAYQBRAEIAbgBBAEcAdwBBAFkAUQBCAHoAQQBGADgAQQBNAGcAQQBzAEEAQwBBAEEAYwBBAEIAaABBAEgASQBBAGQAQQBCAHAAQQBHAE0AQQBhAFEAQgB3AEEARwBFAEEAWQB3AEIAcABBAEcAOABBAGIAZwBCAGYAQQBEAEkAQQBMAEEAQQBnAEEASABZAEEAYgB3AEIAMABBAEcAVQBBAFgAdwBCAGoAQQBHADgAQQBkAFEAQgB1AEEASABRAEEATABBAEEAZwBBAEMAQQBBAGMAQQBCAGgAQQBIAEkAQQBkAEEAQgBwAEEARwBNAEEAYQBRAEIAdwBBAEcARQBBAGQAQQBCAHAAQQBHADgAQQBiAGcAQgBmAEEASABBAEEAWQB3AEIAbgBBAEMAdwBBAEkAQQBCAGoAQQBHAFUAQQBiAGcAQgB6AEEARwA4AEEAWAB3AEIAMABBAEcAOABBAGQAQQBCAGgAQQBHAHcAQQBLAFEAQQBnAEEAQwBVAEEAUABnAEEAbABBAEMAQQBBAEMAZwBBAGcAQQBDAEEAQQBaAGcAQgBwAEEARwB3AEEAZABBAEIAbABBAEgASQBBAEsAQQBCAHcAQQBHAEUAQQBjAGcAQgAwAEEARwBrAEEAWQB3AEIAcABBAEgAQQBBAFkAUQBCADAAQQBHAGsAQQBiAHcAQgB1AEEARgA4AEEAYwBBAEIAagBBAEcAYwBBAEkAQQBBADgAQQBDAEEAQQBNAHcAQQB3AEEAQwBrAEEASQBBAEEAbABBAEQANABBAEoAUQBBAGcAQQBBAG8AQQBJAEEAQQBnAEEARwBFAEEAYwBnAEIAeQBBAEcARQBBAGIAZwBCAG4AQQBHAFUAQQBLAEEAQgB3AEEARwBFAEEAYwBnAEIAMABBAEcAawBBAFkAdwBCAHAAQQBIAEEAQQBZAFEAQgAwAEEARwBrAEEAYgB3AEIAdQBBAEYAOABBAGMAQQBCAGoAQQBHAGMAQQBLAFEAQQBnAEEAQwBVAEEAUABnAEEAbABBAEMAQQBBAEMAZwBBAGcAQQBDAEEAQQBaAGcAQgBwAEEARwB3AEEAZABBAEIAbABBAEgASQBBAEsAQQBCADIAQQBHADgAQQBkAEEAQgBsAEEARgA4AEEAWQB3AEIAdgBBAEgAVQBBAGIAZwBCADAAQQBDAEEAQQBQAFEAQQA5AEEAQwBBAEEAYgBRAEIAaABBAEgAZwBBAEsAQQBCADIAQQBHADgAQQBkAEEAQgBsAEEARgA4AEEAWQB3AEIAdgBBAEgAVQBBAGIAZwBCADAAQQBDAGsAQQBLAFEAQQBnAEEAQwBVAEEAUABnAEEAbABBAEMAQQBBAEMAZwBBAGcAQQBDAEEAQQBZAHcAQgB2AEEARwB3AEEAYgBBAEIAbABBAEcATQBBAGQAQQBBAG8AQQBDAGsAQQBDAGcAQgBnAEEARwBBAEEAWQBBAEEAPQAKAHMAdQBmAGYAaQB4ADoA:31b8e172-b470-440e-83d8-e6b185028602` |
+
+```{r}
+lowturnout %>% 
+  group_by(siglas_2) %>% 
+  summarise(sum_vote = sum(vote_count)) %>% 
+  ungroup() %>% 
+  ggplot(aes(x = reorder(siglas_2,desc(sum_vote)), 
+                       y = sum_vote, fill = siglas_2)) +
+  
+  geom_bar(stat = "identity", na.rm = TRUE) +
+  scale_fill_manual(values = c("PP" ="#0157a1","PSOE" = "#f20400","EAJ" = "#00822a"))+
+                    
+  theme_minimal()+
+
+coord_polar() +
+  annotate( x = 10.5, y = 1000, label = "1000",
+            geom = "text", color = "gray12",size= 3, na.rm = TRUE) +
+ 
+   annotate( x = 10.65,y = 2100, label = "2000", 
+             geom = "text", color = "gray12", size=3, na.rm = TRUE) +
+ 
+   annotate( x = 10.7, y =3100, label = "3000",
+             geom = "text", color = "gray12", size=3, na.rm = TRUE) +
+  
+  annotate( x = 11 , y = 4100, label = "4000", 
+            geom = "text", color = "gray12", size=3, na.rm = TRUE ) +
+  
+ 
+   scale_y_continuous(
+    limits = c(-1500, 4000),
+    expand = c(0, 0),
+    breaks = c(0, 1000, 2000, 3000))+
+   
+  theme(axis.text.y = element_blank(), 
+        axis.text.x = element_text(color = "gray12", size = 8), 
+        legend.position = "none", 
+        legend.title = element_blank(), 
+        plot.title = element_text(face="bold")) +
+  
+  labs( x="", y="", title = "\nTotal votes for each party in municipalities with less than 30% of turnout", 
+            subtitle = paste(
+      "\nPP and PSOE still the most benefited parties when low turnout,",
+      "EAJ-PNV gains votes from low turnout.\n",
+       sep = "\n"
+))
+```
+
+## Analyzing the Correlation Between Population Census and Voting Patterns
+
+5.How to analyze the relationship between census and vote? Is it true that certain parties win in rural areas?
+
+```{r}
+#Vote data frame of interested parties and in rural area (population <= 5000)
+#Criteria for rural based on DEMOGRAFÍA DE LA POBLACIÓN RURAL en 2020
+rural_winners <- tbl(db, "vote_full") |>  
+  left_join(tbl(db, "abbrev_2"), by = join_by("party" == "denominacion")) |>  
+  filter(siglas_2 != "OTHER") |>  
+  left_join(mun_pop_2, by = join_by("cod_mun", "elec_date" == "date")) |> 
+  filter(censo_total <= 5000) |>  
+  collect()
+
+#Winning times in rural zones per party per elections 
+rural_winners %>% 
+  group_by(elec_date, cod_mun) %>% 
+  filter(percent == max(percent)) %>% 
+  group_by(elec_date, siglas_2) %>% 
+  summarise(win_count = n()) %>% 
+  arrange(elec_date,desc(win_count)) 
+```
+
+```{r}
+#2008
+rural_winners %>% 
+  group_by(elec_date, cod_mun) %>% 
+  filter(percent == max(percent)) %>% 
+  ggplot(aes(x = percent, fill = siglas_2)) +
+  geom_histogram(binwidth = 1, show.legend = TRUE) +  
+  labs(
+    title = "Winning Times in Rural Zones per Party",
+    subtitle = "Election Date: From 2008-03-01 to 2019-11-10",
+    x = "Percentage of Votes",
+    y = "Frequency",
+    fill = "Party"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    legend.text = element_text(size = 5),
+    legend.key.size = unit(5, "mm")
+  ) +
+  scale_fill_manual(values = c(
+    "PSOE" = "#f20400",
+    "PP" = "#0157a1",
+    "UP-IU" = "#663278",
+    "CS" = "#e9550d",
+    "EAJ" = "#00822a",
+    "VOX" = "#76b829", 
+    "MP" ="#00e1c5",
+    "CIU" = "#f68b22",
+    "EH-BILDU" = "#95c11f",
+    "BNG" = "#76b4de",
+    "COM" = "#8c3651"
+  )) 
+  
+```
+
+# Analyzing Polling Errors: Accuracy and Discrepancies in Election Forecasts
+
+## Calibrating the error of the polls
+
+6.How to calibrate the error of the polls (remember that the polls are voting intentions at national level - national parties: PSOE, PP, VOX, CS, MP, UP - IU)?
+
+```{r}
+#| output: false
+# Obtaining the average estimated voting intention for each party
+voting_intention <- tbl(db, "surveys") %>%
+  filter(date_elec >= '2008-01-01') %>% 
+  select(siglas, date_elec, field_date_from, field_date_to,estimated_voting_intention) %>%
+  mutate(siglas_imp = case_when(siglas == "PSOE" ~ "PSOE",
+                                siglas == "PP" ~ "PP",
+                                siglas == "CS" ~ "CS",
+                                siglas %in% c("PODEMOS", "UP", "IU") ~ "UP-IU",
+                                siglas == "MP" ~ "MP",
+                                siglas == "VOX" ~ "VOX",
+                                TRUE ~ "OTHER"), .after = "siglas") %>% 
+  group_by(date_elec, siglas_imp) %>%
+  summarise(average_intention = mean(estimated_voting_intention)) %>% 
+  collect()
+
+# Calculate the national vote share for each party
+vote_share_real <- tbl(db, "vote_full") %>% 
+  left_join(tbl(db, "abbrev_2"), by = join_by("party" == "denominacion")) %>%  
+  select(elec_date, cod_mun, party, siglas_2, vote_count, valid_votes) %>% 
+  mutate(siglas_2 = ifelse(siglas_2 %in% c('PSOE', 'PP','VOX', 'CS', 'MP', 'UP-IU'),siglas_2, 'OTHER')) %>% 
+  group_by(elec_date,cod_mun, siglas_2) %>% 
+  summarise(total_votes = sum(vote_count), valid_votes) %>% 
+  group_by(elec_date, siglas_2) %>% 
+  summarise(national_share = sum(total_votes)/sum(valid_votes) *100) %>% 
+  collect() 
+```
+
+```{r}
+#| output: false
+#Comparison(election 2019-11-01)
+vote_share_real %>% 
+  mutate(elec_date = ymd(elec_date)) %>% 
+  filter(elec_date == '2019-11-01') %>% 
+  left_join(voting_intention, by = join_by(closest("elec_date" <= "date_elec"),"siglas_2" == "siglas_imp")) %>% 
+  mutate(poll_error = average_intention - national_share) %>% 
+  ungroup() %>% 
+  select(-elec_date) %>% relocate(date_elec, .before = siglas_2)
+```
+
+### Table
+
+```{r}
+table_data <- vote_share_real %>% 
+  mutate(elec_date = ymd(elec_date)) %>% 
+  filter(elec_date == '2019-11-01') %>% 
+  left_join(voting_intention, by = join_by(closest("elec_date" <= "date_elec"),"siglas_2" == "siglas_imp")) %>% 
+  mutate(poll_error = average_intention - national_share) %>% 
+  ungroup() %>% 
+  select(-elec_date) %>% relocate(date_elec, .before = siglas_2) %>%
+  select(siglas_2, poll_error)
+table_data
+
+```
+
+## Identifying the Election with the Greatest Polling Discrepancies
+
+7.In which election were the polls most wrong?
+
+```{r}
+#| output: false
+error_table <- vote_share_real %>% 
+  mutate(elec_date = ymd(elec_date)) %>% 
+  left_join(voting_intention, by = join_by(closest("elec_date" <= "date_elec"),"siglas_2" == "siglas_imp")) %>% 
+  mutate(poll_error = average_intention - national_share) %>% 
+  ungroup() %>% 
+  select(-elec_date) %>% relocate(date_elec, .before = siglas_2) %>% 
+  group_by(date_elec) %>% 
+  summarise(total_error = sum(abs(poll_error), na.rm = TRUE)) 
+
+error_table |>  slice_max(total_error, n =1) 
+
+```
+
+```{r}
+ggplot(error_table, aes(x = as.character(date_elec), y = total_error)) +
+  geom_bar(stat = "identity", fill = "#87CEEB") +
+  labs(
+    title = "Total Error by Election Date",
+    x = "Election Date",
+    y = "Total Error"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),  
+    axis.title = element_text(face = "bold", size = 12),  
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 10),  
+    axis.text.y = element_text(size = 10)) +
+  scale_y_continuous(expand = expansion(mult = c(0, .1)))  
+
+```
+
+## Assessing Polling Inaccuracies for National Parties
+
+8.How were the polls wrong in national parties (PSOE, PP, VOX, CS, MP, UP - IU)?
+
+```{r}
+error_by_party <- vote_share_real %>% 
+  mutate(elec_date = ymd(elec_date)) %>% 
+  left_join(voting_intention, by = join_by(closest("elec_date" <= "date_elec"),"siglas_2" == "siglas_imp")) %>% 
+  mutate(poll_error = average_intention - national_share) %>% 
+  ungroup() %>% 
+  select(-elec_date) %>% relocate(date_elec, .before = siglas_2) %>% 
+  filter(siglas_2 != "OTHER") %>% 
+  group_by(siglas_2) %>%  
+  summarise(total_error = sum(abs(poll_error), na.rm = TRUE))
+```
+
+```{r}
+ggplot(error_by_party, aes(x = reorder(siglas_2, total_error), y = total_error, fill = siglas_2)) +
+  geom_bar(stat = "identity") +  
+  labs(
+    title = "Total Error by Party",
+    x = "Party",
+    y = "Total Error"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),  
+    axis.title = element_text(face = "bold", size = 12),  
+    axis.text.x = element_text(angle = 45, hjust = 1),    
+    axis.text.y = element_text(size = 10),                
+    legend.position = "none"                              
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, .1))) +
+  scale_fill_manual(values = c(
+    "PSOE" = "#f20400",
+    "PP" = "#0157a1",
+    "UP-IU" = "#663278",
+    "CS" = "#e9550d",
+    "EAJ" = "#00822a",
+    "VOX" = "#76b829", 
+    "MP" ="#00e1c5"
+  ))
+
+```
+
+## Identifying Top Performers and Those with Greatest Deviations
+
+9.Which polling houses got it right the most and which ones deviated the most from the results?
+
+```{r}
+#| output: false
+pollster_estimate <- tbl(db, "surveys") |> 
+  filter(date_elec >= '2008-01-01') |> 
+  select(siglas, pollster, date_elec, field_date_from, field_date_to, 
+         estimated_voting_intention) |> 
+  mutate(siglas_imp = case_when(siglas == "PSOE" ~ "PSOE",
+                                siglas == "PP" ~ "PP",
+                                siglas == "CS" ~ "CS",
+                                siglas %in% c("PODEMOS", "UP", "IU") ~ "UP-IU",
+                                siglas == "MP" ~ "MP",
+                                siglas == "VOX" ~ "VOX",
+                                TRUE ~ "OTHER"), .after = "siglas") |>  
+  group_by(date_elec, pollster, siglas_imp) |> 
+  summarise(average_intention = mean(estimated_voting_intention)) |>  
+  collect() |>  
+  mutate(winner_estimated = siglas_imp[which.max(average_intention)])
+
+
+pollster_result <- pollster_estimate %>% 
+  left_join(vote_share_real %>%
+              mutate(elec_date = ymd(elec_date),
+                     winner = siglas_2[which.max(national_share)]), 
+            by = join_by(closest("date_elec" >= "elec_date"),
+                         "siglas_imp" == "siglas_2"), 
+            keep = TRUE) %>% 
+  mutate(correct_guess = ifelse(winner_estimated == winner, 1,0),
+         error = average_intention - national_share) %>% 
+  select(-elec_date)
+```
+
+```{r}
+#| output: false
+#How many times pollsters correctly estimated winning party
+correct_estimates <- pollster_result %>% 
+  select(date_elec, pollster, correct_guess) %>% 
+  distinct() %>% 
+  group_by(pollster) %>% 
+  summarise(correct_guesses = sum(correct_guess))
+
+#top pollsters
+correct_estimates %>% slice_max(correct_guesses)
+
+#worst pollsters
+correct_estimates %>% slice_min(correct_guesses)
+```
+
+```{r}
+#| output: false
+summarise_pollster_error <- pollster_result %>% 
+  select(date_elec, pollster, error) %>% 
+  group_by(pollster) %>% 
+  summarise(avg_error = mean(abs(error), na.rm = TRUE))
+  
+#Best pollster
+summarise_pollster_error %>% slice_min(avg_error)
+
+#Worst pollster
+summarise_pollster_error %>% slice_max(avg_error)
+```
+
+```{r}
+ggplot(summarise_pollster_error, aes(x = reorder(pollster, avg_error), y = avg_error)) +
+  geom_point(color = "#87CEEB") +  
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid.major = element_line(color = "grey80", size = 0.5),  
+    panel.grid.minor = element_blank(), 
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 8),
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(face = "bold", size = 12),
+    axis.title.x = element_text(face = "bold", size = 10),
+    axis.title.y = element_text(face = "bold", size = 10)
+  ) +
+  labs(
+    title = "Average Polling Error by Pollster",
+    subtitle = "Comparison of polling errors across different organizations",
+    x = "Pollster",
+    y = "Average Error"
+  ) +
+  scale_y_continuous(labels = scales::comma)
+```
+
+------------------------------------------------------------------------
+
+::: {style="text-align: center; font-size: xx-large; font-weight: bold;"}
+THE END
+:::
+
+::: {style="text-align: center; font-size: larger;"}
+<strong>We are open for any questions you guys have.</strong>
+:::
